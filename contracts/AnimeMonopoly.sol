@@ -1,53 +1,84 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
+contract AnimeMonopoly is ERC721Enumerable, Ownable, ReentrancyGuard {
     IERC20 public animeToken;
-    uint256 public constant TOTAL_TILES = 40;
-    uint256 public constant COMMISSION_RATE = 50; // 0.5%
-    uint256 public constant TAX_FLAT_FEE = 10 * 1e18;
-    uint256 public constant BUNKER_RENT = 3 * 1e18;
-    uint256 public constant BUNKER_COST = 50 * 1e18;
+    uint256 public constant TOTAL_TILES = 21;
+    uint256 public constant COMMISSION_RATE = 500; // 5%
+    uint256 public constant BAIL_COST = 1 ether;
+    uint256 public constant BRIBE_COST = 0.8 ether;
+    uint256 public constant BUNKER_INITIAL_PRICE = 0.5 ether;
+    uint256 public constant BUNKER_PRICE_INCREMENT = 0.1 ether;
+    uint256 public constant BUNKER_RENT = 0.05 ether;
     uint256 public constant BUNKER_DAMAGE_COOLDOWN = 60;
+    uint256 public constant TAX_ROLL_COOLDOWN = 5;
+    uint256 public constant TAX_POINTS_PER_ANIME = 100;
+    uint256 public constant BURN_RETURN_RATE = 8000; // 80% (scaled by 10000)
+    uint256 private constant MULTIPLIER_BASE = 100;
     address public treasury;
     bool public initialized;
 
     enum TileType { City, Jail, Tax, Bunker }
-    enum ColorGroup { Red, Blue, Green, Yellow, Purple, Orange }
+    enum ColorGroup {
+        Red,
+        Brown,
+        Orange,
+        LightGreen,
+        Green,
+        Blue
+    }
+
+    enum Vehicle { Bike, Car, Boat, Jet, Rocket }
 
     struct Tile {
         TileType tileType;
-        uint256 tileId;
+        uint256 refId; // city id for cities
+    }
+
+    struct City {
+        string name;
+        ColorGroup set;
         uint256 basePrice;
-        ColorGroup colorGroup;
-        uint256[] owners;
+        uint256 priceIncrement;
+        uint256 baseRent;
+        uint8 radiation; // 0-5
+        uint256 totalUnits;
         mapping(uint256 => uint256) units;
-        address bunkerOwner;
+        mapping(uint256 => uint256) unitCost;
+        uint256 contributions;
+        uint256 sabotage;
+    }
+
+    struct Bunker {
+        address owner;
+        uint256 price;
+        uint256 health;
         uint256 lastDamageTime;
     }
 
     struct PlayerState {
         uint256 tokenId;
         uint256 position;
-        uint256 score;
+        uint256 lastRoll;
         uint256 jailUntil;
-        bool frozen;
+        bool needsTaxAction;
+        uint256 taxPoints;
     }
 
     mapping(uint256 => PlayerState) public playerStates;
     mapping(uint256 => Tile) public board;
+    mapping(uint256 => City) public cities;
+    Bunker public bunker;
     mapping(address => uint256) public addressToTokenId;
     uint256 public nextTokenId = 1;
 
     mapping(address => bytes32) public diceCommitments;
     mapping(address => uint256) public diceRevealDeadline;
-    mapping(uint256 => bool) public scoreRewardClaimed;
 
     event PlayerJoined(address indexed player, uint256 tokenId);
     event PlayerMoved(uint256 indexed tokenId, uint256 from, uint256 to);
@@ -57,26 +88,147 @@ contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
     event JailExited(uint256 indexed tokenId, string method);
     event TaxPaid(uint256 indexed tokenId, uint256 amount, string method);
     event BunkerInteracted(uint256 indexed tokenId, string action);
-    event ScoreUpdated(uint256 indexed tokenId, uint256 newScore);
-    event ScoreRewardClaimed(uint256 indexed tokenId);
+    event TaxActionRequired(uint256 indexed tokenId);
 
-    constructor(address _animeToken) ERC721("AnimeMonopolyPlayer", "AMP") {
+    constructor(address _animeToken) ERC721("AnimeMonopolyPlayer", "AMP") Ownable(msg.sender) {
         animeToken = IERC20(_animeToken);
         treasury = msg.sender;
     }
 
     function initializeBoard() external onlyOwner {
         require(!initialized, "Already initialized");
+
+        string[18] memory names = [
+            "Baghdad",
+            "Caracas",
+            "San Francisco",
+            "Pyongyang",
+            "Karachi",
+            "Jakarta",
+            "Rome",
+            "Buenos Aires",
+            "Istanbul",
+            "Barcelona",
+            "Paris",
+            "London",
+            "Seoul",
+            "Zurich",
+            "New York",
+            "Dubai",
+            "Singapore",
+            "Tokyo"
+        ];
+
+        ColorGroup[18] memory sets = [
+            ColorGroup.Red,
+            ColorGroup.Red,
+            ColorGroup.Red,
+            ColorGroup.Brown,
+            ColorGroup.Brown,
+            ColorGroup.Brown,
+            ColorGroup.Orange,
+            ColorGroup.Orange,
+            ColorGroup.Orange,
+            ColorGroup.LightGreen,
+            ColorGroup.LightGreen,
+            ColorGroup.LightGreen,
+            ColorGroup.Green,
+            ColorGroup.Green,
+            ColorGroup.Green,
+            ColorGroup.Blue,
+            ColorGroup.Blue,
+            ColorGroup.Blue
+        ];
+
+        uint256[18] memory prices = [
+            uint256(0.25 ether),
+            uint256(0.25 ether),
+            uint256(0.25 ether),
+            uint256(0.5 ether),
+            uint256(0.5 ether),
+            uint256(0.5 ether),
+            uint256(1 ether),
+            uint256(1 ether),
+            uint256(1 ether),
+            uint256(1 ether),
+            uint256(1 ether),
+            uint256(1 ether),
+            uint256(2 ether),
+            uint256(2 ether),
+            uint256(2 ether),
+            uint256(4 ether),
+            uint256(4 ether),
+            uint256(4 ether)
+        ];
+
+        uint256[18] memory increments = [
+            uint256(0.001 ether),
+            uint256(0.001 ether),
+            uint256(0.001 ether),
+            uint256(0.002 ether),
+            uint256(0.002 ether),
+            uint256(0.002 ether),
+            uint256(0.005 ether),
+            uint256(0.005 ether),
+            uint256(0.005 ether),
+            uint256(0.005 ether),
+            uint256(0.005 ether),
+            uint256(0.005 ether),
+            uint256(0.01 ether),
+            uint256(0.01 ether),
+            uint256(0.01 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether)
+        ];
+
+        uint256[18] memory rents = [
+            uint256(0.01 ether),
+            uint256(0.01 ether),
+            uint256(0.01 ether),
+            uint256(0.02 ether),
+            uint256(0.02 ether),
+            uint256(0.02 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.05 ether),
+            uint256(0.1 ether),
+            uint256(0.1 ether),
+            uint256(0.1 ether),
+            uint256(0.2 ether),
+            uint256(0.2 ether),
+            uint256(0.2 ether)
+        ];
+
+        uint256 cityIndex = 0;
         for (uint256 i = 0; i < TOTAL_TILES; i++) {
-            Tile storage tile = board[i];
-            tile.tileId = i;
-            if (i % 10 == 0) tile.tileType = TileType.Jail;
-            else if (i % 15 == 0) tile.tileType = TileType.Tax;
-            else if (i % 7 == 0) tile.tileType = TileType.Bunker;
-            else tile.tileType = TileType.City;
-            tile.basePrice = 10 * 1e18 + (i % 5) * 2 * 1e18;
-            tile.colorGroup = ColorGroup(i % 6);
+            Tile storage t = board[i];
+            if (i == 3) {
+                t.tileType = TileType.Jail;
+            } else if (i == 10) {
+                t.tileType = TileType.Tax;
+            } else if (i == 14) {
+                t.tileType = TileType.Bunker;
+            } else {
+                t.tileType = TileType.City;
+                t.refId = cityIndex;
+                City storage c = cities[cityIndex];
+                c.name = names[cityIndex];
+                c.set = sets[cityIndex];
+                c.basePrice = prices[cityIndex];
+                c.priceIncrement = increments[cityIndex];
+                c.baseRent = rents[cityIndex];
+                c.radiation = 5;
+                cityIndex++;
+            }
         }
+
+        bunker.price = BUNKER_INITIAL_PRICE;
+        bunker.health = 50000;
+
         initialized = true;
     }
 
@@ -85,12 +237,24 @@ contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
         uint256 tokenId = nextTokenId++;
         _safeMint(msg.sender, tokenId);
         addressToTokenId[msg.sender] = tokenId;
-        playerStates[tokenId] = PlayerState(tokenId, 0, 0, 0, false);
+        playerStates[tokenId] = PlayerState({
+            tokenId: tokenId,
+            position: 0,
+            lastRoll: 0,
+            jailUntil: 0,
+            needsTaxAction: false,
+            taxPoints: 0
+        });
         emit PlayerJoined(msg.sender, tokenId);
     }
 
     function commitDice(bytes32 commitment) external {
         require(ownerOf(addressToTokenId[msg.sender]) == msg.sender, "Not your player");
+        uint256 tokenId = addressToTokenId[msg.sender];
+        PlayerState storage state = playerStates[tokenId];
+        require(block.timestamp >= state.lastRoll + TAX_ROLL_COOLDOWN, "Wait to roll");
+        require(!state.needsTaxAction, "Handle tax first");
+        require(block.timestamp >= state.jailUntil, "In jail");
         diceCommitments[msg.sender] = commitment;
         diceRevealDeadline[msg.sender] = block.timestamp + 300;
     }
@@ -106,32 +270,35 @@ contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
         diceRevealDeadline[msg.sender] = 0;
 
         uint256 tokenId = addressToTokenId[msg.sender];
-        if (block.timestamp < playerStates[tokenId].jailUntil) {
-            if (roll > 4) {
-                playerStates[tokenId].jailUntil = 0;
-                emit JailExited(tokenId, "roll");
-                movePlayer(msg.sender, roll);
-            } else {
-                revert("Failed to escape jail with dice roll");
-            }
-        } else {
-            movePlayer(msg.sender, roll);
-        }
+        playerStates[tokenId].lastRoll = block.timestamp;
+        movePlayer(msg.sender, roll);
     }
 
-    function payToExitJail() external nonReentrant {
+    function payBail() external nonReentrant {
         uint256 tokenId = addressToTokenId[msg.sender];
         require(block.timestamp < playerStates[tokenId].jailUntil, "Not in jail");
-        uint256 fee = 5 * 1e18;
-        require(animeToken.transferFrom(msg.sender, treasury, fee), "Payment failed");
+        require(animeToken.transferFrom(msg.sender, treasury, BAIL_COST), "bail fail");
         playerStates[tokenId].jailUntil = 0;
-        emit JailExited(tokenId, "payment");
+        _addTaxPoints(tokenId, BAIL_COST);
+        emit JailExited(tokenId, "bail");
+    }
+
+    function attemptBribe(uint256 nonce) external nonReentrant {
+        uint256 tokenId = addressToTokenId[msg.sender];
+        require(block.timestamp < playerStates[tokenId].jailUntil, "Not in jail");
+        require(animeToken.transferFrom(msg.sender, treasury, BRIBE_COST), "bribe fail");
+        uint256 rand = uint256(keccak256(abi.encodePacked(blockhash(block.number - 1), nonce, msg.sender))) % 100;
+        _addTaxPoints(tokenId, BRIBE_COST);
+        if (rand < 40) {
+            playerStates[tokenId].jailUntil = 0;
+            emit JailExited(tokenId, "bribe");
+        }
     }
 
     function movePlayer(address player, uint256 steps) internal {
         uint256 tokenId = addressToTokenId[player];
         PlayerState storage state = playerStates[tokenId];
-        require(!state.frozen, "Frozen");
+        require(!state.needsTaxAction, "Pending tax");
         require(block.timestamp >= state.jailUntil, "In jail");
 
         uint256 oldPos = state.position;
@@ -141,22 +308,13 @@ contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
         Tile storage tile = board[newPos];
 
         if (tile.tileType == TileType.City) {
-            handleCity(tile, tokenId);
+            handleCity(tile.refId, tokenId);
         } else if (tile.tileType == TileType.Jail) {
-            state.jailUntil = block.timestamp + 60;
+            state.jailUntil = block.timestamp + _jailWaitTime(tokenId);
             emit JailEntered(tokenId);
         } else if (tile.tileType == TileType.Tax) {
-            uint256 balance = animeToken.balanceOf(player);
-            uint256 percentTax = (balance * 30) / 100;
-            if (animeToken.allowance(player, address(this)) >= percentTax && animeToken.balanceOf(player) >= percentTax) {
-                require(animeToken.transferFrom(player, treasury, percentTax), "Percent tax fail");
-                emit TaxPaid(tokenId, percentTax, "percentage");
-            } else if (animeToken.allowance(player, address(this)) >= TAX_FLAT_FEE && animeToken.balanceOf(player) >= TAX_FLAT_FEE) {
-                require(animeToken.transferFrom(player, treasury, TAX_FLAT_FEE), "Flat tax fail");
-                emit TaxPaid(tokenId, TAX_FLAT_FEE, "flat");
-            } else {
-                state.frozen = true;
-            }
+            state.needsTaxAction = true;
+            emit TaxActionRequired(tokenId);
         } else if (tile.tileType == TileType.Bunker) {
             emit BunkerInteracted(tokenId, "landed");
         }
@@ -164,112 +322,197 @@ contract AnimeMonopoly is ERC721, ERC721Enumerable, Ownable, ReentrancyGuard {
         emit PlayerMoved(tokenId, oldPos, newPos);
     }
 
-    function ownsAllColorGroup(ColorGroup group, uint256 tokenId) public view returns (bool) {
-        for (uint256 i = 0; i < TOTAL_TILES; i++) {
-            Tile storage tile = board[i];
-            if (tile.tileType == TileType.City && tile.colorGroup == group) {
-                bool owns = false;
-                for (uint256 j = 0; j < tile.owners.length; j++) {
-                    if (tile.owners[j] == tokenId) {
-                        owns = true;
+
+    function handleCity(uint256 cityId, uint256 tokenId) internal {
+        City storage city = cities[cityId];
+        address player = ownerOf(tokenId);
+
+        if (city.totalUnits > 0 && city.units[tokenId] == 0) {
+            uint256 rent = _calcRent(cityId);
+            uint256 vehicleMult = _vehicleMultiplier(tokenId);
+            uint256 totalDue = rent * vehicleMult;
+            require(animeToken.transferFrom(player, treasury, totalDue), "rent fail");
+            _addTaxPoints(tokenId, totalDue);
+            _distributeRent(cityId, totalDue);
+            emit RentPaid(tokenId, cityId, totalDue);
+        }
+    }
+
+    function mintUnit() external nonReentrant {
+        uint256 tokenId = addressToTokenId[msg.sender];
+        PlayerState storage state = playerStates[tokenId];
+        Tile storage t = board[state.position];
+        require(t.tileType == TileType.City, "Not on city");
+        uint256 cityId = t.refId;
+        City storage city = cities[cityId];
+        uint256 price = city.basePrice + city.priceIncrement * city.totalUnits;
+        require(animeToken.transferFrom(msg.sender, treasury, price), "pay fail");
+        city.totalUnits += 1;
+        city.units[tokenId] += 1;
+        city.unitCost[tokenId] += price;
+        city.contributions += price * TAX_POINTS_PER_ANIME;
+        _addTaxPoints(tokenId, price);
+        _updateRadiation(cityId);
+        emit PropertyBought(tokenId, cityId, city.units[tokenId]);
+    }
+
+    function burnUnit(uint256 cityId) external nonReentrant {
+        uint256 tokenId = addressToTokenId[msg.sender];
+        City storage city = cities[cityId];
+        require(city.units[tokenId] > 0, "No units");
+        uint256 avgCost = city.unitCost[tokenId] / city.units[tokenId];
+        uint256 refund = (avgCost * BURN_RETURN_RATE) / 10000;
+        city.units[tokenId] -= 1;
+        city.unitCost[tokenId] -= avgCost;
+        city.totalUnits -= 1;
+        require(animeToken.transfer(msg.sender, refund), "refund fail");
+    }
+
+    function _distributeRent(uint256 cityId, uint256 totalRent) internal {
+        City storage city = cities[cityId];
+        for (uint256 i = 1; i < nextTokenId; i++) {
+            uint256 units = city.units[i];
+            if (units > 0) {
+                uint256 share = (totalRent * units) / city.totalUnits;
+                uint256 multiplier = 100 + 5 * _completedSets(i);
+                share = (share * multiplier) / 100;
+                animeToken.transfer(ownerOf(i), share);
+            }
+        }
+        city.contributions += totalRent * TAX_POINTS_PER_ANIME;
+        _updateRadiation(cityId);
+    }
+
+    function _calcRent(uint256 cityId) internal view returns (uint256) {
+        City storage city = cities[cityId];
+        uint256 mult;
+        if (city.radiation == 0) mult = 400;
+        else if (city.radiation == 1) mult = 160;
+        else if (city.radiation == 2) mult = 140;
+        else if (city.radiation == 3) mult = 120;
+        else if (city.radiation == 4) mult = 110;
+        else mult = 100;
+        return (city.baseRent * mult) / 100;
+    }
+
+    function _vehicleMultiplier(uint256 tokenId) internal view returns (uint256) {
+        uint256 count;
+        for (uint256 i = 0; i < 18; i++) {
+            count += cities[i].units[tokenId];
+        }
+        if (count >= 100) return 10;
+        if (count >= 60) return 4;
+        if (count >= 40) return 3;
+        if (count >= 20) return 2;
+        return 1;
+    }
+
+    function _jailWaitTime(uint256 tokenId) internal view returns (uint256) {
+        uint256 mult = _vehicleMultiplier(tokenId);
+        if (mult == 1) return 12 hours;
+        if (mult == 2) return 18 hours;
+        if (mult == 3) return 24 hours;
+        if (mult == 4) return 36 hours;
+        return 48 hours;
+    }
+
+    function _completedSets(uint256 tokenId) internal view returns (uint256) {
+        uint256 count = 0;
+        for (uint256 s = 0; s < 6; s++) {
+            bool ownsAll = true;
+            for (uint256 i = 0; i < 18; i++) {
+                if (cities[i].set == ColorGroup(s)) {
+                    if (cities[i].units[tokenId] == 0) {
+                        ownsAll = false;
                         break;
                     }
                 }
-                if (!owns) {
-                    return false;
-                }
             }
+            if (ownsAll) count++;
         }
-        return true;
+        return count;
     }
 
-    function handleCity(Tile storage tile, uint256 tokenId) internal {
-        address player = ownerOf(tokenId);
-        uint256 unitPrice = tile.basePrice + tile.owners.length * 1e18;
-        require(animeToken.transferFrom(player, treasury, unitPrice), "Buy fail");
-        tile.owners.push(tokenId);
-        tile.units[tokenId] += 1;
-
-        uint256 rent = unitPrice / 10;
-        bool hasBonus = ownsAllColorGroup(tile.colorGroup, tokenId);
-        if (hasBonus) {
-            rent = (rent * 3) / 2;
-        }
-        uint256 split = rent / tile.owners.length;
-        for (uint256 i = 0; i < tile.owners.length; i++) {
-            uint256 ownerId = tile.owners[i];
-            address ownerAddr = ownerOf(ownerId);
-            if (ownerAddr != player) {
-                animeToken.transferFrom(player, ownerAddr, split);
-                emit RentPaid(tokenId, tile.tileId, split);
-            }
-        }
-
-        playerStates[tokenId].score += unitPrice;
-        emit PropertyBought(tokenId, tile.tileId, 1);
-        emit ScoreUpdated(tokenId, playerStates[tokenId].score);
+    function _updateRadiation(uint256 cityId) internal {
+        City storage city = cities[cityId];
+        int256 score = int256(city.contributions) - int256(city.sabotage);
+        uint8 level = 5;
+        if (score >= 100000) level = 0;
+        else if (score >= 60000) level = 1;
+        else if (score >= 40000) level = 2;
+        else if (score >= 20000) level = 3;
+        else if (score >= 10000) level = 4;
+        city.radiation = level;
     }
 
-    function payTaxFlatFee() external nonReentrant {
+    function _addTaxPoints(uint256 tokenId, uint256 animeAmount) internal {
+        playerStates[tokenId].taxPoints += (animeAmount / 1 ether) * TAX_POINTS_PER_ANIME;
+    }
+
+    function fileTaxes() external nonReentrant {
         uint256 tokenId = addressToTokenId[msg.sender];
-        require(ownerOf(tokenId) == msg.sender, "Not owner");
-        require(!playerStates[tokenId].frozen, "Already frozen");
-        require(animeToken.transferFrom(msg.sender, treasury, TAX_FLAT_FEE), "Flat tax failed");
-        emit TaxPaid(tokenId, TAX_FLAT_FEE, "flat");
+        PlayerState storage state = playerStates[tokenId];
+        require(state.needsTaxAction, "No action required");
+        require(board[state.position].tileType == TileType.Tax, "Not at tax");
+        state.needsTaxAction = false;
+        uint256 rand = uint256(keccak256(abi.encodePacked(blockhash(block.number - 1), msg.sender))) % 100;
+        if (rand < 50) {
+            state.taxPoints *= 2;
+            emit TaxPaid(tokenId, 0, "doubled");
+        } else {
+            state.taxPoints = 0;
+            emit TaxPaid(tokenId, 0, "lost");
+        }
     }
 
-    function interactWithBunker(uint256 tileId, string calldata action) external nonReentrant {
+    function useTaxPoints(uint256 cityId, bool contribute, uint256 amount) external nonReentrant {
         uint256 tokenId = addressToTokenId[msg.sender];
-        Tile storage tile = board[tileId];
-        require(tile.tileType == TileType.Bunker, "Not a bunker tile");
+        PlayerState storage state = playerStates[tokenId];
+        require(state.taxPoints >= amount, "Insufficient points");
+        if (state.needsTaxAction) {
+            require(board[state.position].tileType == TileType.Tax, "Not at tax");
+            state.needsTaxAction = false;
+        }
+        if (contribute) {
+            cities[cityId].contributions += amount;
+        } else {
+            cities[cityId].sabotage += amount;
+        }
+        state.taxPoints -= amount;
+        _updateRadiation(cityId);
+        emit TaxPaid(tokenId, amount, contribute ? "contribute" : "sabotage");
+    }
+
+    function interactWithBunker(string calldata action) external nonReentrant {
+        uint256 tokenId = addressToTokenId[msg.sender];
+        require(board[playerStates[tokenId].position].tileType == TileType.Bunker, "Not on bunker");
 
         if (keccak256(bytes(action)) == keccak256("rent")) {
-            require(animeToken.transferFrom(msg.sender, tile.bunkerOwner, BUNKER_RENT), "Rent fail");
+            require(bunker.owner != address(0), "Unowned");
+            require(animeToken.transferFrom(msg.sender, bunker.owner, BUNKER_RENT), "Rent fail");
+            _addTaxPoints(tokenId, BUNKER_RENT);
             emit BunkerInteracted(tokenId, "rent");
         } else if (keccak256(bytes(action)) == keccak256("buy")) {
-            require(tile.bunkerOwner == address(0), "Already owned");
-            require(animeToken.transferFrom(msg.sender, treasury, BUNKER_COST), "Buy fail");
-            tile.bunkerOwner = msg.sender;
+            require(animeToken.transferFrom(msg.sender, treasury, bunker.price), "Buy fail");
+            bunker.owner = msg.sender;
+            bunker.price += BUNKER_PRICE_INCREMENT;
+            _addTaxPoints(tokenId, bunker.price);
             emit BunkerInteracted(tokenId, "buy");
         } else if (keccak256(bytes(action)) == keccak256("damage")) {
-            require(block.timestamp >= tile.lastDamageTime + BUNKER_DAMAGE_COOLDOWN, "Cooldown");
-            tile.lastDamageTime = block.timestamp;
+            require(block.timestamp >= bunker.lastDamageTime + BUNKER_DAMAGE_COOLDOWN, "Cooldown");
+            bunker.lastDamageTime = block.timestamp;
+            require(playerStates[tokenId].taxPoints >= 1, "No tax points");
+            bunker.health -= 1;
+            playerStates[tokenId].taxPoints -= 1;
             emit BunkerInteracted(tokenId, "damage");
         } else {
             revert("Invalid action");
         }
     }
 
-    function claimScoreReward() external nonReentrant {
-        uint256 tokenId = addressToTokenId[msg.sender];
-        require(!scoreRewardClaimed[tokenId], "Already claimed");
-        uint256 score = playerStates[tokenId].score;
-        require(score >= 100 * 1e18, "Not enough score");
-        uint256 reward = score / 10;
-        scoreRewardClaimed[tokenId] = true;
-        require(animeToken.transfer(msg.sender, reward), "Reward transfer failed");
-        emit ScoreRewardClaimed(tokenId);
-    }
 
-    function getPlayerScore(uint256 tokenId) external view returns (uint256) {
-        return playerStates[tokenId].score;
-    }
 
-    function getPlayerRank(uint256 tokenId) external view returns (uint256 rank) {
-        uint256 playerScore = playerStates[tokenId].score;
-        rank = 1;
-        for (uint256 i = 1; i < nextTokenId; i++) {
-            if (i != tokenId && playerStates[i].score > playerScore) {
-                rank++;
-            }
-        }
-    }
-
-    function _beforeTokenTransfer(address from, address to, uint256 tokenId, uint256 batchSize) internal override(ERC721, ERC721Enumerable) {
-        super._beforeTokenTransfer(from, to, tokenId, batchSize);
-    }
-
-    function supportsInterface(bytes4 interfaceId) public view override(ERC721, ERC721Enumerable) returns (bool) {
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721Enumerable) returns (bool) {
         return super.supportsInterface(interfaceId);
     }
 }
