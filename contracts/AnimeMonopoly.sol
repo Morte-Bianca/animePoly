@@ -19,7 +19,7 @@ contract AnimeMonopoly is ERC721Enumerable, Ownable, ReentrancyGuard {
     uint256 public constant TAX_ROLL_COOLDOWN = 5;
     uint256 public constant TAX_POINTS_PER_ANIME = 100;
     uint256 public constant BURN_RETURN_RATE = 8000; // 80% (scaled by 10000)
-    uint256 private constant MULTIPLIER_BASE = 100;
+    uint256 private constant PRECISION = 1e18;
     address public treasury;
     bool public initialized;
 
@@ -345,7 +345,7 @@ contract AnimeMonopoly is ERC721Enumerable, Ownable, ReentrancyGuard {
         require(t.tileType == TileType.City, "Not on city");
         uint256 cityId = t.refId;
         City storage city = cities[cityId];
-        uint256 price = city.basePrice + city.priceIncrement * city.totalUnits;
+        uint256 price = _cityPrice(cityId);
         require(animeToken.transferFrom(msg.sender, treasury, price), "pay fail");
         city.totalUnits += 1;
         city.units[tokenId] += 1;
@@ -366,6 +366,24 @@ contract AnimeMonopoly is ERC721Enumerable, Ownable, ReentrancyGuard {
         city.unitCost[tokenId] -= avgCost;
         city.totalUnits -= 1;
         require(animeToken.transfer(msg.sender, refund), "refund fail");
+    }
+
+    function _pow(uint256 base, uint256 exp) internal pure returns (uint256 result) {
+        result = PRECISION;
+        for (uint256 i = 0; i < exp; i++) {
+            result = (result * base) / PRECISION;
+        }
+    }
+
+    function _cityPrice(uint256 cityId) internal view returns (uint256) {
+        City storage city = cities[cityId];
+        uint256 factor = PRECISION + city.priceIncrement;
+        uint256 mult = _pow(factor, city.totalUnits);
+        return (city.basePrice * mult) / PRECISION;
+    }
+
+    function getCityPrice(uint256 cityId) external view returns (uint256) {
+        return _cityPrice(cityId);
     }
 
     function _distributeRent(uint256 cityId, uint256 totalRent) internal {
@@ -493,10 +511,11 @@ contract AnimeMonopoly is ERC721Enumerable, Ownable, ReentrancyGuard {
             _addTaxPoints(tokenId, BUNKER_RENT);
             emit BunkerInteracted(tokenId, "rent");
         } else if (keccak256(bytes(action)) == keccak256("buy")) {
-            require(animeToken.transferFrom(msg.sender, treasury, bunker.price), "Buy fail");
+            uint256 pricePaid = bunker.price;
+            require(animeToken.transferFrom(msg.sender, treasury, pricePaid), "Buy fail");
             bunker.owner = msg.sender;
-            bunker.price += BUNKER_PRICE_INCREMENT;
-            _addTaxPoints(tokenId, bunker.price);
+            bunker.price = (bunker.price * (PRECISION + BUNKER_PRICE_INCREMENT)) / PRECISION;
+            _addTaxPoints(tokenId, pricePaid);
             emit BunkerInteracted(tokenId, "buy");
         } else if (keccak256(bytes(action)) == keccak256("damage")) {
             require(block.timestamp >= bunker.lastDamageTime + BUNKER_DAMAGE_COOLDOWN, "Cooldown");
